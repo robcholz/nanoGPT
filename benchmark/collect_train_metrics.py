@@ -60,8 +60,18 @@ class TrainSourceMap:
         self.forward_lines = self._find_lines("logits, loss = model(X, Y)")
         self.backward_lines = self._find_lines("scaler.scale(loss).backward()")
         self.checkpoint_lines = self._find_lines("torch.save(checkpoint")
+        self.loss_scale_lines = self._find_lines("loss = loss / gradient_accumulation_steps")
+        self.eval_call_lines = self._find_lines("losses = estimate_loss()")
+        self.logging_lines = set()
+        for needle in (
+            "lossf = loss.item() * gradient_accumulation_steps",
+            "mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)",
+            'print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")',
+        ):
+            self.logging_lines.update(self._find_lines(needle))
         self.optimizer_lines = set()
         for needle in (
+            "if grad_clip != 0.0:",
             "scaler.unscale_(optimizer)",
             "clip_grad_norm_(",
             "scaler.step(optimizer)",
@@ -75,6 +85,7 @@ class TrainSourceMap:
             "X, Y = get_batch(split)",
         ):
             self.dataloader_lines.update(self._find_lines(needle))
+        self.eval_range = self._find_function_range("estimate_loss")
 
     def _extract_function_ranges(self, tree: ast.AST) -> dict[str, FunctionRange]:
         functions: dict[str, FunctionRange] = {}
@@ -83,6 +94,9 @@ class TrainSourceMap:
                 functions[node.name] = FunctionRange(node.lineno, node.end_lineno)
         return functions
 
+    def _find_function_range(self, name: str) -> Optional[FunctionRange]:
+        return self.functions.get(name)
+
     def _find_lines(self, needle: str) -> set[int]:
         return {index + 1 for index, line in enumerate(self.lines) if needle in line}
 
@@ -90,7 +104,11 @@ class TrainSourceMap:
         get_batch_range = self.functions.get("get_batch")
         if get_batch_range and get_batch_range.contains(lineno):
             return "dataloader"
+        if self.eval_range and self.eval_range.contains(lineno):
+            return "forward"
         if lineno in self.checkpoint_lines:
+            return "checkpoint"
+        if lineno in self.eval_call_lines:
             return "checkpoint"
         if lineno in self.backward_lines:
             return "backward"
@@ -98,8 +116,12 @@ class TrainSourceMap:
             return "optimizer"
         if lineno in self.forward_lines:
             return "forward"
+        if lineno in self.loss_scale_lines:
+            return "forward"
         if lineno in self.dataloader_lines:
             return "dataloader"
+        if lineno in self.logging_lines:
+            return "idle"
         return "idle"
 
 
@@ -128,6 +150,7 @@ class ProcSampler:
                 "cpu_util_percent",
                 "gpu_util_percent",
                 "gpu_mem_mb",
+                "gpu_power_w",
                 "host_mem_mb",
                 "disk_read_mb_s",
                 "disk_write_mb_s",
@@ -160,7 +183,7 @@ class ProcSampler:
             read_delta = current["read_bytes"] - previous["read_bytes"]
             write_delta = current["write_bytes"] - previous["write_bytes"]
             step, phase = self._current_step_and_phase()
-            gpu_util, gpu_mem = self._read_gpu_metrics()
+            gpu_util, gpu_mem, gpu_power = self._read_gpu_metrics()
 
             self.writer.writerow(
                 {
@@ -170,6 +193,7 @@ class ProcSampler:
                     "cpu_util_percent": csv_value(100.0 * cpu_delta / elapsed),
                     "gpu_util_percent": csv_value(gpu_util),
                     "gpu_mem_mb": csv_value(gpu_mem),
+                    "gpu_power_w": csv_value(gpu_power),
                     "host_mem_mb": csv_value(current["rss_bytes"] / MB),
                     "disk_read_mb_s": csv_value(read_delta / elapsed / MB),
                     "disk_write_mb_s": csv_value(write_delta / elapsed / MB),
@@ -179,15 +203,26 @@ class ProcSampler:
 
     def _current_step_and_phase(self) -> tuple[int, str]:
         frame = sys._current_frames().get(self.main_thread_id)
+        train_frames = []
         while frame is not None:
             filename = os.path.abspath(frame.f_code.co_filename)
             if filename == str(self.script_path):
-                step = frame.f_locals.get("iter_num", frame.f_globals.get("iter_num", -1))
-                if not isinstance(step, int):
-                    step = -1
-                return step, self.source_map.classify(frame.f_lineno)
+                train_frames.append(frame)
             frame = frame.f_back
-        return -1, "idle"
+        if not train_frames:
+            return -1, "idle"
+
+        phase = "idle"
+        for train_frame in train_frames:
+            phase = self.source_map.classify(train_frame.f_lineno)
+            if phase != "idle":
+                break
+
+        outermost_frame = train_frames[-1]
+        step = outermost_frame.f_globals.get("iter_num", -1)
+        if not isinstance(step, int):
+            step = -1
+        return step, phase
 
     def _read_counters(self) -> dict[str, float]:
         cpu_time = self._read_process_cpu_time()
@@ -236,34 +271,38 @@ class ProcSampler:
             self._disk_devices = devices
         return self._disk_devices
 
-    def _read_gpu_metrics(self) -> tuple[Optional[float], Optional[float]]:
+    def _read_gpu_metrics(self) -> tuple[Optional[float], Optional[float], Optional[float]]:
         if torch is None or not torch.cuda.is_available():
-            return None, None
+            return None, None, None
 
         device = self._current_cuda_device()
         gpu_util = None
         gpu_mem = None
+        gpu_power = None
+        smi_util, smi_power = self._read_gpu_telemetry_via_nvidia_smi(device)
 
         try:
             gpu_util = float(torch.cuda.utilization(device))
         except Exception:
-            gpu_util = self._read_gpu_util_via_nvidia_smi(device)
+            gpu_util = smi_util
 
         try:
             gpu_mem = torch.cuda.memory_allocated(device) / MB
         except Exception:
             gpu_mem = None
 
-        return gpu_util, gpu_mem
+        gpu_power = smi_power
 
-    def _read_gpu_util_via_nvidia_smi(self, device: int) -> Optional[float]:
+        return gpu_util, gpu_mem, gpu_power
+
+    def _read_gpu_telemetry_via_nvidia_smi(self, device: int) -> tuple[Optional[float], Optional[float]]:
         try:
             proc = subprocess.run(
                 [
                     "nvidia-smi",
                     "-i",
                     str(device),
-                    "--query-gpu=utilization.gpu",
+                    "--query-gpu=utilization.gpu,power.draw",
                     "--format=csv,noheader,nounits",
                 ],
                 check=True,
@@ -272,12 +311,20 @@ class ProcSampler:
                 timeout=1.0,
             )
         except Exception:
-            return None
+            return None, None
         output = proc.stdout.strip().splitlines()
         if not output:
+            return None, None
+        values = [part.strip() for part in output[0].split(",")]
+        if len(values) != 2:
+            return None, None
+        return self._parse_optional_float(values[0]), self._parse_optional_float(values[1])
+
+    def _parse_optional_float(self, value: str) -> Optional[float]:
+        if not value or value.upper() == "N/A":
             return None
         try:
-            return float(output[0].strip())
+            return float(value)
         except ValueError:
             return None
 

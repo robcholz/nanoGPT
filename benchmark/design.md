@@ -14,6 +14,7 @@ We collect the following data:
 - cpu_util_percent
 - gpu_util_percent
 - gpu_mem_mb
+- gpu_power_w
 - host_mem_mb
 - disk_read_mb_s
 - disk_write_mb_s
