@@ -8,9 +8,11 @@ We collect the following data:
   - forward 
   - backward
   - optimizer 
+  - eval
   - checkpoint 
   - dataloader 
   - idle
+- interval_s
 - cpu_util_percent
 - gpu_util_percent
 - gpu_mem_mb

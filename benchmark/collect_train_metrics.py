@@ -59,9 +59,26 @@ class TrainSourceMap:
         self.functions = self._extract_function_ranges(tree)
         self.forward_lines = self._find_lines("logits, loss = model(X, Y)")
         self.backward_lines = self._find_lines("scaler.scale(loss).backward()")
-        self.checkpoint_lines = self._find_lines("torch.save(checkpoint")
+        self.checkpoint_lines = set()
+        for needle in (
+            "checkpoint = {",
+            "'model': raw_model.state_dict(),",
+            "'optimizer': optimizer.state_dict(),",
+            "print(f\"saving checkpoint to {out_dir}\")",
+            "torch.save(checkpoint",
+        ):
+            self.checkpoint_lines.update(self._find_lines(needle))
         self.loss_scale_lines = self._find_lines("loss = loss / gradient_accumulation_steps")
-        self.eval_call_lines = self._find_lines("losses = estimate_loss()")
+        self.eval_lines = set()
+        for needle in (
+            "if iter_num % eval_interval == 0 and master_process:",
+            "losses = estimate_loss()",
+            "print(f\"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}\")",
+            "wandb.log({",
+            "if losses['val'] < best_val_loss or always_save_checkpoint:",
+            "best_val_loss = losses['val']",
+        ):
+            self.eval_lines.update(self._find_lines(needle))
         self.logging_lines = set()
         for needle in (
             "lossf = loss.item() * gradient_accumulation_steps",
@@ -105,10 +122,10 @@ class TrainSourceMap:
         if get_batch_range and get_batch_range.contains(lineno):
             return "dataloader"
         if self.eval_range and self.eval_range.contains(lineno):
-            return "forward"
+            return "eval"
+        if lineno in self.eval_lines:
+            return "eval"
         if lineno in self.checkpoint_lines:
-            return "checkpoint"
-        if lineno in self.eval_call_lines:
             return "checkpoint"
         if lineno in self.backward_lines:
             return "backward"
@@ -147,6 +164,7 @@ class ProcSampler:
                 "timestamp",
                 "step",
                 "phase",
+                "interval_s",
                 "cpu_util_percent",
                 "gpu_util_percent",
                 "gpu_mem_mb",
@@ -157,7 +175,7 @@ class ProcSampler:
             ],
         )
         self.writer.writeheader()
-        self.last_sample = self._read_counters()
+        self.last_sample = self._read_sample()
         self.thread = threading.Thread(target=self._run, name="train-metrics-sampler", daemon=True)
         self.thread.start()
 
@@ -172,7 +190,7 @@ class ProcSampler:
     def _run(self) -> None:
         while not self.stop_event.is_set():
             time.sleep(self.interval_s)
-            current = self._read_counters()
+            current = self._read_sample()
             previous = self.last_sample
             self.last_sample = current
             if previous is None or self.writer is None or self.file_handle is None:
@@ -182,19 +200,18 @@ class ProcSampler:
             cpu_delta = current["cpu_time"] - previous["cpu_time"]
             read_delta = current["read_bytes"] - previous["read_bytes"]
             write_delta = current["write_bytes"] - previous["write_bytes"]
-            step, phase = self._current_step_and_phase()
-            gpu_util, gpu_mem, gpu_power = self._read_gpu_metrics()
 
             self.writer.writerow(
                 {
-                    "timestamp": utc_now(),
-                    "step": step,
-                    "phase": phase,
+                    "timestamp": previous["timestamp"],
+                    "step": previous["step"],
+                    "phase": previous["phase"],
+                    "interval_s": csv_value(elapsed),
                     "cpu_util_percent": csv_value(100.0 * cpu_delta / elapsed),
-                    "gpu_util_percent": csv_value(gpu_util),
-                    "gpu_mem_mb": csv_value(gpu_mem),
-                    "gpu_power_w": csv_value(gpu_power),
-                    "host_mem_mb": csv_value(current["rss_bytes"] / MB),
+                    "gpu_util_percent": csv_value(previous["gpu_util"]),
+                    "gpu_mem_mb": csv_value(previous["gpu_mem"]),
+                    "gpu_power_w": csv_value(previous["gpu_power"]),
+                    "host_mem_mb": csv_value(previous["rss_bytes"] / MB),
                     "disk_read_mb_s": csv_value(read_delta / elapsed / MB),
                     "disk_write_mb_s": csv_value(write_delta / elapsed / MB),
                 }
@@ -224,15 +241,23 @@ class ProcSampler:
             step = -1
         return step, phase
 
-    def _read_counters(self) -> dict[str, float]:
+    def _read_sample(self) -> dict[str, float | int | str | None]:
+        step, phase = self._current_step_and_phase()
+        gpu_util, gpu_mem, gpu_power = self._read_gpu_metrics()
         cpu_time = self._read_process_cpu_time()
         read_bytes, write_bytes = self._read_host_disk_bytes()
         return {
+            "timestamp": utc_now(),
             "wall_time": time.monotonic(),
+            "step": step,
+            "phase": phase,
             "cpu_time": cpu_time,
             "read_bytes": read_bytes,
             "write_bytes": write_bytes,
             "rss_bytes": self._read_process_rss_bytes(),
+            "gpu_util": gpu_util,
+            "gpu_mem": gpu_mem,
+            "gpu_power": gpu_power,
         }
 
     def _read_process_cpu_time(self) -> float:
